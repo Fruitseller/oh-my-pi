@@ -18,7 +18,7 @@ import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { COLLAB_PROTO, type CollabFrame, formatCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
-import type { ExtensionRunnerEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/lifecycle-mirror";
+import type { MappedExtensionEvent } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/lifecycle-mirror";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -27,7 +27,13 @@ import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memor
 interface Harness {
 	guest: CollabGuestLink;
 	hostSocket: CollabSocket;
-	emitted: ExtensionRunnerEvent[];
+	/** Mock runner receiving the mirrored events; per-test overrides allowed. */
+	runner: {
+		hasHandlers: () => boolean;
+		emit: (event: MappedExtensionEvent) => Promise<unknown>;
+	};
+	emitted: MappedExtensionEvent[];
+
 	/** Deterministic apply-chain barrier via a sentinel `error` frame. */
 	barrier(): Promise<void>;
 	cleanup(): Promise<void>;
@@ -43,14 +49,15 @@ function makeState(): Extract<CollabFrame, { t: "welcome" }>["state"] {
 	};
 }
 
-async function makeHarness(roomId: string): Promise<Harness> {
+async function makeHarness(roomId: string, options: { isStreaming?: boolean } = {}): Promise<Harness> {
 	const roomKey = generateRoomKey();
 	const cryptoKey = await importRoomKey(roomKey);
 	const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
 
-	const emitted: ExtensionRunnerEvent[] = [];
+	const emitted: MappedExtensionEvent[] = [];
 	const runner = {
-		emit: (event: ExtensionRunnerEvent) => {
+		hasHandlers: () => true,
+		emit: (event: MappedExtensionEvent) => {
 			emitted.push(event);
 			return Promise.resolve();
 		},
@@ -76,7 +83,7 @@ async function makeHarness(roomId: string): Promise<Harness> {
 				t: "welcome",
 				proto: COLLAB_PROTO,
 				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-				state: makeState(),
+				state: { ...makeState(), isStreaming: options.isStreaming ?? false },
 				agents: [],
 				entryCount: 0,
 			} as CollabFrame);
@@ -113,6 +120,9 @@ async function makeHarness(roomId: string): Promise<Harness> {
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		loadingAnimation: undefined,
+		ensureLoadingAnimation: () => {},
+		autoCompactionLoader: undefined,
+		retryLoader: undefined,
 		statusLine: {
 			setCollabStatus: () => {},
 			invalidate: () => {},
@@ -148,6 +158,7 @@ async function makeHarness(roomId: string): Promise<Harness> {
 	const harness: Harness = {
 		guest,
 		hostSocket,
+		runner,
 		emitted,
 		barrier,
 		cleanup: async () => {
@@ -214,9 +225,9 @@ describe("collab guest extension lifecycle mirror", () => {
 		}
 	});
 
-	it("numbers mirrored turns itself", async () => {
+	it("resets turn numbering on each agent_start like a local session", async () => {
 		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
-		const harness = await makeHarness("lifecycle-mirror-room-3");
+		const harness = await makeHarness("lifecycle-mirror-room-4");
 		try {
 			const assistantMessage: AgentMessage = {
 				role: "assistant",
@@ -235,22 +246,146 @@ describe("collab guest extension lifecycle mirror", () => {
 				stopReason: "stop",
 				timestamp: Date.now(),
 			};
-			harness.hostSocket.send({ t: "event", event: { type: "turn_start" } } as CollabFrame);
+			const runTurns = (): void => {
+				harness.hostSocket.send({ t: "event", event: { type: "turn_start" } } as CollabFrame);
+				harness.hostSocket.send({
+					t: "event",
+					event: { type: "turn_end", message: assistantMessage, toolResults: [] },
+				} as CollabFrame);
+			};
+			// Two host prompts, two turns each: a local session numbers both
+			// runs 0,1 — the mirror must not keep counting across agent_start.
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			runTurns();
+			runTurns();
 			harness.hostSocket.send({
 				t: "event",
-				event: { type: "turn_end", message: assistantMessage, toolResults: [] },
+				event: { type: "agent_end", messages: [], isTerminal: true },
 			} as CollabFrame);
-			harness.hostSocket.send({ t: "event", event: { type: "turn_start" } } as CollabFrame);
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			runTurns();
+			runTurns();
 			harness.hostSocket.send({
 				t: "event",
-				event: { type: "turn_end", message: assistantMessage, toolResults: [] },
+				event: { type: "agent_end", messages: [], isTerminal: true },
 			} as CollabFrame);
 			await harness.barrier();
 
 			const starts = harness.emitted.filter(event => event.type === "turn_start");
-			const ends = harness.emitted.filter(event => event.type === "turn_end");
-			expect(starts.map(event => event.turnIndex)).toEqual([0, 1]);
-			expect(ends.map(event => event.turnIndex)).toEqual([0, 1]);
+			expect(starts.map(event => event.turnIndex)).toEqual([0, 1, 0, 1]);
+		} finally {
+			writeSpy.mockRestore();
+			await harness.cleanup();
+		}
+	});
+
+	it("detaches message_end payloads from the transcript's live reference", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const harness = await makeHarness("lifecycle-mirror-room-5");
+		try {
+			const message: AgentMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "live" }],
+				api: "mock",
+				provider: "mock",
+				model: "mock",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			};
+			harness.hostSocket.send({ t: "event", event: { type: "message_end", message } } as CollabFrame);
+			await harness.barrier();
+
+			const ends = harness.emitted.filter(event => event.type === "message_end");
+			expect(ends.length).toBe(1);
+			// An extension mutating its notification copy must not rewrite the
+			// same object the guest renders from.
+			const delivered = ends[0].message;
+			expect(delivered).not.toBe(message);
+			// The assistant-message shape is the transcript-relevant one here;
+			// narrowing via the input object keeps the mutation contract typed.
+			const liveAssistant = message as { content: { type: string; text: string }[] };
+			const deliveredAssistant = delivered as { content: { type: string; text: string }[] };
+			deliveredAssistant.content = [{ type: "text", text: "mutated by extension" }];
+			expect(liveAssistant.content[0].text).toBe("live");
+		} finally {
+			writeSpy.mockRestore();
+			await harness.cleanup();
+		}
+	});
+
+	it("delivers mirrored events to handlers in emission order", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		// The mock runner resolves agent_start on an externally-gated promise;
+		// unordered fire-and-forget would let the agent_end handler complete
+		// first and relatch the pane to working after the host settled.
+		const harness = await makeHarness("lifecycle-mirror-room-6");
+		try {
+			const gate = Promise.withResolvers<void>();
+			const completionOrder: string[] = [];
+			let sawAgentEnd = false;
+			harness.runner.emit = (event: MappedExtensionEvent) => {
+				completionOrder.push(event.type);
+				if (event.type === "agent_start") {
+					return gate.promise as Promise<undefined>;
+				}
+				sawAgentEnd = true;
+				return Promise.resolve(undefined);
+			};
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			harness.hostSocket.send({
+				t: "event",
+				event: { type: "agent_end", messages: [], isTerminal: true },
+			} as CollabFrame);
+			await harness.barrier();
+
+			// The gated agent_start must hold agent_end back: emission is
+			// chained, so agent_end's handler has not even started yet.
+			expect(completionOrder).toEqual(["agent_start"]);
+			expect(sawAgentEnd).toBe(false);
+			gate.resolve();
+			await Bun.sleep(10);
+			expect(completionOrder).toEqual(["agent_start", "agent_end"]);
+		} finally {
+			writeSpy.mockRestore();
+			await harness.cleanup();
+		}
+	});
+
+	it("synthesizes agent_start when joining while the host is mid-run", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		// The host's agent_start predates the join, so no event frame carries
+		// it — the welcome's `isStreaming` is the only signal the mirror gets.
+		const harness = await makeHarness("lifecycle-mirror-room-7", { isStreaming: true });
+		try {
+			expect(harness.emitted.filter(event => event.type === "agent_start").length).toBe(1);
+		} finally {
+			writeSpy.mockRestore();
+			await harness.cleanup();
+		}
+	});
+
+	it("synthesizes a terminal agent_end when leaving mid-run", async () => {
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		const harness = await makeHarness("lifecycle-mirror-room-8");
+		try {
+			harness.hostSocket.send({ t: "event", event: { type: "agent_start" } } as CollabFrame);
+			await harness.barrier();
+			expect(harness.emitted.filter(event => event.type === "agent_start").length).toBe(1);
+
+			// /leave before the host settles: the terminal agent_end frame never
+			// arrives, the mirror must unlatch the pane on restore.
+			await harness.guest.leave("mid-run");
+			const ends = harness.emitted.filter(event => event.type === "agent_end");
+			expect(ends.length).toBe(1);
+			expect(ends[0].willContinue).toBeUndefined();
 		} finally {
 			writeSpy.mockRestore();
 			await harness.cleanup();
