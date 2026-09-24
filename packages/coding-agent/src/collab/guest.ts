@@ -5,13 +5,16 @@
  * drives it through the normal `/resume` machinery, then applies live frames:
  * entries → SessionManager + agent.replaceMessages, events →
  * EventController.handleEvent, state → status-line overrides plus real
- * model/thinking state applied to the replica agent. The host's subagent
- * ecosystem is mirrored too: agent snapshots populate a local AgentRegistry
- * (Agent Hub), EventBus traffic (observer HUD) is republished, and hub
- * actions (chat/kill/revive/transcript reads) round-trip over the wire.
- * Host ask dialogs (`ui-request` select/editor) present through the same
- * hook selector/editor seam and answer with `ui-response`; `ui-request-end`
- * dismisses a pending presentation without responding.
+ * model/thinking state applied to the replica agent. Lifecycle-relevant
+ * mirrored events additionally reach the local extension runner, so
+ * lifecycle integrations (Herdr pane state, RPC trackers, stats) observe host
+ * activity even though the guest's own agent loop never runs. The host's
+ * subagent ecosystem is mirrored too: agent snapshots populate a local
+ * AgentRegistry (Agent Hub), EventBus traffic (observer HUD) is republished,
+ * and hub actions (chat/kill/revive/transcript reads) round-trip over the
+ * wire. Host ask dialogs (`ui-request` select/editor) present through the
+ * same hook selector/editor seam and answer with `ui-response`;
+ * `ui-request-end` dismisses a pending presentation without responding.
  * Everything renders through the same components, so ctrl+o, theming, and
  * transcript behavior are native by construction.
  */
@@ -26,6 +29,7 @@ import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { shouldDisableReasoning, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import { emitSubagentFrame } from "../utils/event-bus";
+import { GuestLifecycleEmitter } from "../extensibility/extensions/lifecycle-mirror";
 import { setSessionTerminalTitle } from "../utils/title-generator";
 import { importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
@@ -631,7 +635,17 @@ export class CollabGuestLink {
 			void this.#ctx.eventController.handleEvent({ type: "message_start", message: event.message });
 		}
 		void this.#ctx.eventController.handleEvent(event);
+		// Lifecycle mirror: the guest's own agent loop never runs, so the session's
+		// extension-event path stays silent. Route the mirrored wire event
+		// through the same mapping the session uses so extension-installed
+		// lifecycle integrations (Herdr pane state, RPC trackers, stats) observe
+		// host working/idle transitions while joined. Fire-and-forget by
+		// design — a slow extension handler must not stall frame application.
+		const runner = this.#ctx.session.extensionRunner;
+		if (runner) this.#lifecycleEmitter.emit(runner, event);
 	}
+
+	#lifecycleEmitter = new GuestLifecycleEmitter();
 
 	/**
 	 * Apply the host's real model/thinking state to the replica agent so model
